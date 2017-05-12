@@ -810,6 +810,9 @@ cryptodev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg_)
 	struct session_op sop;
 	struct kernel_crypt_op kcop;
 	struct kernel_crypt_auth_op kcaop;
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(4, 3, 0))
+	struct kernel_crypt_pkop pkop;
+#endif
 	struct crypt_priv *pcr = filp->private_data;
 	struct fcrypt *fcr;
 	struct session_info_op siop;
@@ -823,7 +826,11 @@ cryptodev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg_)
 
 	switch (cmd) {
 	case CIOCASYMFEAT:
-		return put_user(0, p);
+		ses = 0;
+		if (crypto_has_alg("rsa", 0, 0)) {
+			ses = CRF_MOD_EXP;
+		}
+		return put_user(ses, p);
 	case CRIOGET:
 		fd = clonefd(filp);
 		ret = put_user(fd, p);
@@ -859,6 +866,14 @@ cryptodev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg_)
 		if (unlikely(ret))
 			return ret;
 		return copy_to_user(arg, &siop, sizeof(siop));
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(4, 3, 0))
+	case CIOCKEY:
+		ret = copy_from_user(&pkop.pkop, arg, sizeof(struct crypt_kop));
+		if (ret == 0) {
+			ret = crypto_run_asym(&pkop);
+		}
+		return ret;
+#endif
 	case CIOCCRYPT:
 		if (unlikely(ret = kcop_from_user(&kcop, fcr, arg))) {
 			dwarning(1, "Error copying from user");

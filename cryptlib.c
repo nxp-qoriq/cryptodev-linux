@@ -37,6 +37,10 @@
 #include <crypto/authenc.h>
 #include "cryptodev_int.h"
 #include "cipherapi.h"
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(4, 3, 0))
+#include <linux/asn1_ber_bytecode.h>
+#include <crypto/akcipher.h>
+#endif
 
 extern const struct crypto_type crypto_givcipher_type;
 
@@ -435,3 +439,233 @@ int cryptodev_hash_final(struct hash_data *hdata, void *output)
 	return waitfor(&hdata->async.result, ret);
 }
 
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(4, 3, 0))
+/* This function is necessary because the bignums in Linux kernel are MSB first
+ * (big endian) as opposed to LSB first as OpenBSD crypto layer uses */
+void reverse_buf(uint8_t *buf, size_t sz)
+{
+	int i;
+	uint8_t *end;
+	uint8_t tmp;
+
+	end = buf + sz;
+
+	for (i = 0; i < sz/2; i++) {
+		end--;
+
+		tmp = *buf;
+		*buf = *end;
+		*end = tmp;
+
+		buf++;
+	}
+}
+
+int ber_wr_tag(uint8_t **ber_ptr, uint8_t tag)
+{
+	**ber_ptr = tag;
+	*ber_ptr += 1;
+
+	return 0;
+}
+
+int ber_wr_len(uint8_t **ber_ptr, size_t len, size_t sz)
+{
+	if (len < 127) {
+		**ber_ptr = len;
+		*ber_ptr += 1;
+	} else {
+		size_t sz_save = sz;
+
+		sz--;
+		**ber_ptr = 0x80 | sz;
+
+		while (sz > 0) {
+			*(*ber_ptr + sz) = len & 0xff;
+			len >>= 8;
+			sz--;
+		}
+		*ber_ptr += sz_save;
+	}
+
+	return 0;
+}
+
+int ber_wr_int(uint8_t **ber_ptr, uint8_t *crp_p, size_t sz)
+{
+	int ret;
+
+	ret = copy_from_user(*ber_ptr, crp_p, sz);
+	reverse_buf(*ber_ptr, sz);
+
+	*ber_ptr += sz;
+
+	return ret;
+}
+
+/* calculate the size of the length field itself in BER encoding */
+size_t ber_enc_len(size_t len)
+{
+	size_t sz;
+
+	sz = 1;
+	if (len > 127) {		/* long encoding */
+		while (len != 0) {
+			len >>= 8;
+			sz++;
+		}
+	}
+
+	return sz;
+}
+
+void *cryptodev_alloc_rsa_pub_key(struct kernel_crypt_pkop *pkop,
+		uint32_t *key_len)
+{
+	struct crypt_kop *cop = &pkop->pkop;
+	uint8_t *ber_key;
+	uint8_t *ber_ptr;
+	uint32_t ber_key_len;
+	size_t s_sz;
+	size_t e_sz;
+	size_t n_sz;
+	size_t s_enc_len;
+	size_t e_enc_len;
+	size_t n_enc_len;
+	int err;
+
+	/* BER public key format:
+	 * SEQUENCE TAG         1 byte
+	 * SEQUENCE LENGTH	s_enc_len bytes
+	 * INTEGER TAG		1 byte
+	 * INTEGER LENGTH	n_enc_len bytes
+	 * INTEGER (n modulus)	n_sz bytes
+	 * INTEGER TAG		1 byte
+	 * INTEGER LENGTH	e_enc_len bytes
+	 * INTEGER (e exponent)	e_sz bytes
+	 */
+
+	e_sz = (cop->crk_param[1].crp_nbits + 7)/8;
+	n_sz = (cop->crk_param[2].crp_nbits + 7)/8;
+
+	e_enc_len = ber_enc_len(e_sz);
+	n_enc_len = ber_enc_len(n_sz);
+
+	/*
+	 * Sequence length is the size of all the fields following the sequence
+	 * tag, added together. The two added bytes account for the two INT
+	 * tags in the Public Key sequence
+	 */
+	s_sz = e_sz + e_enc_len + n_sz + n_enc_len + 2;
+	s_enc_len = ber_enc_len(s_sz);
+
+	/* The added byte accounts for the SEQ tag at the start of the key */
+	ber_key_len = s_sz + s_enc_len + 1;
+
+	/* Linux asn1_ber_decoder doesn't like keys that are too large */
+	if (ber_key_len > 65535) {
+		return NULL;
+	}
+
+	ber_key = kmalloc(ber_key_len, GFP_DMA);
+	if (!ber_key) {
+		return NULL;
+	}
+
+	ber_ptr = ber_key;
+
+	err = ber_wr_tag(&ber_ptr, _tag(UNIV, CONS, SEQ))         ||
+	      ber_wr_len(&ber_ptr, s_sz, s_enc_len)               ||
+	      ber_wr_tag(&ber_ptr, _tag(UNIV, PRIM, INT))         ||
+	      ber_wr_len(&ber_ptr, n_sz, n_enc_len)               ||
+	      ber_wr_int(&ber_ptr, cop->crk_param[2].crp_p, n_sz) ||
+	      ber_wr_tag(&ber_ptr, _tag(UNIV, PRIM, INT))         ||
+	      ber_wr_len(&ber_ptr, e_sz, e_enc_len)               ||
+	      ber_wr_int(&ber_ptr, cop->crk_param[1].crp_p, e_sz);
+	if (err != 0) {
+		goto free_key;
+	}
+
+	*key_len = ber_key_len;
+	return ber_key;
+
+free_key:
+	kfree(ber_key);
+	return NULL;
+}
+
+int crypto_bn_modexp(struct kernel_crypt_pkop *pkop)
+{
+	struct crypt_kop *cop = &pkop->pkop;
+	uint8_t *ber_key;
+	uint32_t ber_key_len;
+	size_t m_sz;
+	size_t c_sz;
+	size_t c_sz_max;
+	uint8_t *m_buf;
+	uint8_t *c_buf;
+	struct scatterlist src;
+	struct scatterlist dst;
+	int err;
+
+	ber_key = cryptodev_alloc_rsa_pub_key(pkop, &ber_key_len);
+	if (!ber_key) {
+		return -ENOMEM;
+	}
+
+	err = crypto_akcipher_set_pub_key(pkop->s, ber_key, ber_key_len);
+	if (err != 0) {
+		goto free_key;
+	}
+
+	m_sz = (cop->crk_param[0].crp_nbits + 7)/8;
+	c_sz = (cop->crk_param[3].crp_nbits + 7)/8;
+
+	m_buf = kmalloc(m_sz, GFP_DMA);
+	if (!m_buf) {
+		err = -ENOMEM;
+		goto free_key;
+	}
+
+	err = copy_from_user(m_buf, cop->crk_param[0].crp_p, m_sz);
+	if (err != 0) {
+		goto free_m_buf;
+	}
+	reverse_buf(m_buf, m_sz);
+
+	c_sz_max = crypto_akcipher_maxsize(pkop->s);
+	if (c_sz > c_sz_max) {
+		err = -EINVAL;
+		goto free_m_buf;
+	}
+
+	c_buf = kzalloc(c_sz_max, GFP_KERNEL);
+	if (!c_buf) {
+		goto free_m_buf;
+	}
+
+	sg_init_one(&src, m_buf, m_sz);
+	sg_init_one(&dst, c_buf, c_sz);
+
+	init_completion(&pkop->result.completion);
+	akcipher_request_set_callback(pkop->req, 0,
+			cryptodev_complete, &pkop->result);
+	akcipher_request_set_crypt(pkop->req, &src, &dst, m_sz, c_sz);
+
+	err = crypto_akcipher_encrypt(pkop->req);
+	err = waitfor(&pkop->result, err);
+
+	if (err == 0) {
+		reverse_buf(c_buf, c_sz);
+		err = copy_to_user(cop->crk_param[3].crp_p, c_buf, c_sz);
+	}
+
+	kfree(c_buf);
+free_m_buf:
+	kfree(m_buf);
+free_key:
+	kfree(ber_key);
+
+	return err;
+}
+#endif

@@ -19,6 +19,10 @@
 #include <linux/scatterlist.h>
 #include <crypto/cryptodev.h>
 #include <crypto/aead.h>
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(4, 3, 0))
+#include <crypto/internal/rsa.h>
+#endif
+
 
 #define PFX "cryptodev: "
 #define dprintk(level, severity, format, a...)			\
@@ -111,6 +115,18 @@ struct kernel_crypt_auth_op {
 	struct mm_struct *mm;
 };
 
+#if (LINUX_VERSION_CODE > KERNEL_VERSION(4, 3, 0))
+struct kernel_crypt_pkop {
+	struct crypt_kop pkop;
+
+	struct crypto_akcipher *s;    /* Transform pointer from CryptoAPI */
+	struct akcipher_request *req; /* PKC request allocated from CryptoAPI */
+	struct cryptodev_result result;	/* updated by completion handler */
+};
+
+int crypto_run_asym(struct kernel_crypt_pkop *pkop);
+#endif
+
 /* auth */
 
 int kcaop_from_user(struct kernel_crypt_auth_op *kcop,
@@ -121,6 +137,7 @@ int crypto_auth_run(struct fcrypt *fcr, struct kernel_crypt_auth_op *kcaop);
 int crypto_run(struct fcrypt *fcr, struct kernel_crypt_op *kcop);
 
 #include <cryptlib.h>
+
 
 /* other internal structs */
 struct csession {
