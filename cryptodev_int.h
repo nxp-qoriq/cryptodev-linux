@@ -35,6 +35,11 @@
 #define ddebug(level, format, a...) dprintk(level, KERN_DEBUG, format, ##a)
 
 
+struct cryptodev_result {
+	struct completion completion;
+	int err;
+};
+
 extern int cryptodev_verbosity;
 
 struct fcrypt {

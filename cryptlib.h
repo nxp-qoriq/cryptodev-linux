@@ -2,12 +2,6 @@
 # define CRYPTLIB_H
 
 #include <linux/version.h>
-
-struct cryptodev_result {
-	struct completion completion;
-	int err;
-};
-
 #include "cipherapi.h"
 
 struct cipher_data {
